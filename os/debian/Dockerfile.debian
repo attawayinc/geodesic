@@ -1,16 +1,16 @@
 # https://www.debian.org/releases/
 # https://hub.docker.com/_/debian
-# We use codename (bullseye) instead of version number (11) because we want to select
+# We use codename (bookworm) instead of version number (12) because we want to select
 # the matching Python Docker image, which is named after the codename only.
-# bullseye-20231120 corresponds to Debian 11.8
-ARG DEBIAN_CODENAME=bullseye
+# bookworm-20240130 corresponds to Debian 12.4
+ARG DEBIAN_CODENAME=bookworm
 # Debian codenamed images are tagged with date codes rather than minor version numbers.
-ARG DEBAIN_DATECODE=20231120
+ARG DEBAIN_DATECODE=20240130
 # Find the current version of Python at https://www.python.org/downloads/source/
-ARG PYTHON_VERSION=3.11.6
+ARG PYTHON_VERSION=3.12.2
 
 # https://cloud.google.com/sdk/docs/release-notes
-ARG GOOGLE_CLOUD_SDK_VERSION=455.0.0
+ARG GOOGLE_CLOUD_SDK_VERSION=463.0.0
 # https://github.com/ahmetb/kubectx/releases
 ARG KUBECTX_COMPLETION_VERSION=0.9.5
 # https://github.com/jonmosco/kube-ps1/releases
@@ -20,7 +20,7 @@ ARG SESSION_MANAGER_PLUGIN_VERSION=latest
 
 # Helm plugins:
 # https://github.com/databus23/helm-diff/releases
-ARG HELM_DIFF_VERSION=3.8.1
+ARG HELM_DIFF_VERSION=3.9.4
 # https://github.com/aslafy-z/helm-git/releases
 # We had issues with helm-diff 3.1.3 + helm-git 0.9.0,
 # previous workaround was to pin helm-git to version 0.8.1.
@@ -55,7 +55,7 @@ RUN python3 -m pip install --upgrade --progress-bar off pip setuptools wheel && 
     pip install --progress-bar off -r /requirements.txt --prefix=/usr/local --no-build-isolation
 
 # Remove Python cache files
-RUN find / -name __pycache__ -exec rm -rf {} \; -prune
+RUN find / -xdev -name __pycache__ -exec rm -rf {} \; -prune
 
 #
 # Geodesic base image
@@ -65,6 +65,14 @@ FROM debian:${DEBIAN_CODENAME}-${DEBAIN_DATECODE}-slim
 ARG VERSION
 ENV GEODESIC_VERSION=$VERSION
 ENV GEODESIC_OS=debian
+
+# TARGETARCH and TARGETOS are defined by buildkit, but not available with other builders
+ARG TARGETARCH
+ARG TARGETOS
+RUN [ -n "$TARGETARCH" ] && [ -n "$TARGETOS" ] || (echo "Geodesic must be built with buildkit."; echo "See: https://docs.docker.com/build/buildkit/"; false)
+RUN [ "$TARGETARCH" = "amd64" ] || [ "$TARGETARCH" = "arm64" ] || (echo "Unsupported TARGETARCH: \"$TARGETARCH\"" && false)
+RUN [ "$TARGETOS" = "linux" ] || (echo "Unsupported TARGETOS: \"$TARGETOS\"" && false)
+
 
 # Set a default terminal to "dumb" (headless) to make `tput` happy when running scripts.
 # When we launch Geodesic for interactive use, we forward the host value of `TERM`
@@ -113,14 +121,16 @@ COPY packages.txt packages-amd64-only.txt os/debian/packages-debian.txt /etc/apt
 RUN apt-get update && apt-get install -y apt-utils curl
 RUN curl -1sLf 'https://dl.cloudsmith.io/public/cloudposse/packages/cfg/setup/bash.deb.sh' | bash
 
-# Install Google package repo
-RUN echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
-RUN curl -1sLf 'https://packages.cloud.google.com/apt/doc/apt-key.gpg' | APT_KEY_DONT_WARN_ON_DANGEROUS_USAGE=true apt-key --keyring /usr/share/keyrings/cloud.google.gpg add -
-
+# Install packages, but do not yet install the Google package repo because we do not want their version of kubectl
 RUN apt-get update && apt-get install -y \
     $(grep -h -v '^#' /etc/apt/packages.txt /etc/apt/packages-debian.txt | sed -E 's/@(cloudposse|community|testing)//g' ) && \
     mkdir -p /etc/bash_completion.d/ /etc/profile.d/ /conf && \
     touch /conf/.gitconfig
+
+# Install Google package repo
+RUN echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
+RUN curl -1sLf 'https://packages.cloud.google.com/apt/doc/apt-key.gpg' | APT_KEY_DONT_WARN_ON_DANGEROUS_USAGE=true apt-key --keyring /usr/share/keyrings/cloud.google.gpg add -
+
 
 # Here is where we would confirm that the package repo checksum is what we expect (not mismatched due to Docker layer cache)
 
@@ -262,11 +272,10 @@ ENV DIRENV_ENABLED=false
 ENV MAKEFLAGS="--no-print-directory"
 
 # Install "root" filesystem
+# Debian, starting with v12 (bookworm), has symbolic links for /bin, /sbin, and /lib
+# so we cannot have those directories under rootfs and copy the whole directory.
 COPY rootfs/ /
 COPY os/debian/rootfs/ /
-
-
-ARG TARGETARCH
 
 # For certain pagkage we like to have but are not available on arm64,
 # install them on amd64, and link to a stub script on arm64.
@@ -284,22 +293,27 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
 # We do this at the end because we need cache busting from above to get us the latest AWS CLI v2
 
 RUN mv /usr/local/bin/aws /usr/local/bin/aws1 && \
-    update-alternatives --install /usr/local/bin/aws aws /usr/local/bin/aws1 1
+    mv /usr/local/bin/aws_completer /usr/local/bin/aws1_completer && \
+    update-alternatives --install /usr/local/bin/aws aws /usr/local/bin/aws1 1  \
+    --slave /usr/local/bin/aws_completer aws_completer /usr/local/bin/aws1_completer
 
 # Install AWS CLI 2
 # Get AWS CLI V2 version from https://github.com/aws/aws-cli/blob/v2/CHANGELOG.rst if you want
 # but it is updated several times a week, so we choose to just get the latest.
 # ARG AWS_CLI_VERSION=2.2.8
 RUN AWSTMPDIR=$(mktemp -d -t aws-inst-XXXXXXXXXX) && \
-    if [ "$TARGETARCH" = "amd64" ]; then \
-      AWS_ARCH=x86_64; else AWS_ARCH=aarch64; fi && \
-    curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-${AWS_ARCH}${AWS_CLI_VERSION:+-${AWS_CLI_VERSION}}.zip" -o "$AWSTMPDIR/awscliv2.zip" && \
-    cd $AWSTMPDIR && \
-    unzip -qq awscliv2.zip && \
-    ./aws/install -i /usr/share/aws/v2 -b /usr/share/aws/v2/bin && \
-    update-alternatives --install /usr/local/bin/aws aws /usr/share/aws/v2/bin/aws 2 && \
-    update-alternatives --set aws /usr/share/aws/v2/bin/aws && ln -s /usr/share/aws/v2/bin/aws /usr/local/bin/aws2 && \
-    rm -rf $AWSTMPDIR
+      if [ "$TARGETARCH" = "amd64" ]; then \
+        AWS_ARCH=x86_64; else AWS_ARCH=aarch64; fi && \
+      curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-${AWS_ARCH}${AWS_CLI_VERSION:+-${AWS_CLI_VERSION}}.zip" -o "$AWSTMPDIR/awscliv2.zip" && \
+      savedir="$PWD" && cd $AWSTMPDIR && \
+      unzip -qq awscliv2.zip && \
+      ./aws/install -i /usr/share/aws/v2 -b /usr/share/aws/v2/bin && \
+      update-alternatives --install /usr/local/bin/aws aws /usr/share/aws/v2/bin/aws 2 \
+      --slave /usr/local/bin/aws_completer aws_completer /usr/share/aws/v2/bin/aws_completer && \
+      update-alternatives --set aws /usr/share/aws/v2/bin/aws && \
+      ln -s /usr/share/aws/v2/bin/aws /usr/local/bin/aws2 && \
+      ln -s /usr/share/aws/v2/bin/aws_completer /usr/local/bin/aws2_completer && \
+      cd "$savedir" && rm -rf $AWSTMPDIR
 
 # We recommend AWS_PAGER="less -FRX" but you can override it in your Dockerfile
 # or in your Geodesic preferences (see `man customization`).
@@ -316,10 +330,10 @@ ENV AWS_PAGER="less -FRX"
 ARG SESSION_MANAGER_PLUGIN_VERSION
 RUN if [ "$TARGETARCH" = "amd64" ]; then \
       AWS_ARCH=64bit; else AWS_ARCH="$TARGETARCH"; fi && \
-    curl -L "https://s3.amazonaws.com/session-manager-downloads/plugin/${SESSION_MANAGER_PLUGIN_VERSION}/ubuntu_${AWS_ARCH}/session-manager-plugin.deb" \
+    curl -sSL "https://s3.amazonaws.com/session-manager-downloads/plugin/${SESSION_MANAGER_PLUGIN_VERSION}/ubuntu_${AWS_ARCH}/session-manager-plugin.deb" \
     -o "/tmp/session-manager-plugin.deb" && \
     sudo dpkg -i /tmp/session-manager-plugin.deb && \
-    rm /tmp/session-manager-plugin.deb
+    rm -f /tmp/session-manager-plugin.deb
 
 # Install documentation
 COPY docs/ /usr/share/docs/
